@@ -338,6 +338,7 @@ function render(){
   }
 
   if(UI.tab==='new'){
+    if($('cTitle'))return; // النموذج مفتوح: لا تُعِد رسمه حتى لا تُمسح الخانات أثناء الكتابة
     m.innerHTML='<div class="card"><div class="title">قائمة مهام جديدة</div>'+
       '<label>إلى (اختياري)</label><input id="cTo" maxlength="40" placeholder="اسم الطرف الآخر">'+
       '<label>عنوان القائمة</label><input id="cTitle" maxlength="80" placeholder="مثال: مهام يوم السبت">'+
