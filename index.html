@@ -101,12 +101,17 @@ textarea{min-height:170px;resize:vertical;line-height:1.7}
 .sheet h3{margin:0 0 6px;font-size:17px;color:var(--olive)}
 #toast{position:fixed;bottom:calc(86px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);background:#23261a;color:#fff;padding:10px 18px;border-radius:20px;font-size:14px;z-index:60;opacity:0;pointer-events:none;transition:opacity .25s;max-width:90%;text-align:center}
 #toast.show{opacity:1}
+.pend{font-size:15px}
+.pill.bt{opacity:.55;padding:6px 9px}
+.pill.bt.on{opacity:1;background:#2a6fdb;border-color:#9cc0ff}
 </style>
 </head>
 <body>
 <header>
   <span class="net" id="net" title="الاتصال"></span>
   <h1>📋 المهام المشتركة</h1>
+  <span id="pend" class="pend" hidden>⏳</span>
+  <button class="pill bt" id="btBtn" hidden onclick="btConnectMenu()">🔵</button>
   <button class="pill" onclick="openSettings()" id="meBtn">⚙️</button>
 </header>
 <main id="main"></main>
@@ -147,11 +152,15 @@ textarea{min-height:170px;resize:vertical;line-height:1.7}
 const DB='https://todo-share-5ef5c-default-rtdb.europe-west1.firebasedatabase.app';
 const KEY='todoShare.v2';
 const CUR='د.ل';
-let S={me:'',id:'',room:'',seen:{},cache:null};
+const NATIVE=typeof window.AndroidBT!=='undefined';   // داخل تطبيق APK
+let S={me:'',id:'',room:'',seen:{},cache:null,dirty:{}};
 try{const r=localStorage.getItem(KEY);if(r)S=Object.assign(S,JSON.parse(r));}catch(e){}
+if(!S.dirty)S.dirty={};
 const UI={tab:'lists',open:null,range:'month',from:'',to:''};
-let R={lists:{},members:{}};          // شجرة الغرفة الحية
-let prev=null, es=null, online=false, firstSync=false, swReg=null;
+let R={lists:{},members:{}};      // الحالة المحلية المدموجة (المرجع للعرض)
+let RT={lists:{},members:{}};     // صورة ما على الخادم
+let prev=null, es=null, online=false, firstSync=false, swReg=null, streamReady=false;
+const BTS={state:'off',peer:'',synced:false};   // حالة البلوثوث
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -171,45 +180,100 @@ if(S.cache&&S.room)R=Object.assign({lists:{},members:{}},S.cache);
 function toast(m){const t=$('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),2800);}
 function openM(id){$(id).classList.add('show');}
 function closeM(id){$(id).classList.remove('show');}
-const baseURL=()=>location.origin+location.pathname;
+const WEB='https://musbahsaad.github.io/todo-share/';
+const baseURL=()=>/^https:\/\/musbahsaad\.github\.io/.test(location.origin)?location.origin+location.pathname:WEB;
 const pairLink=()=>baseURL()+'#room='+S.room;
+const clone=o=>o==null?o:JSON.parse(JSON.stringify(o));
 
 /* ===== أدوات البيانات ===== */
 const ord=x=>x.o!=null?x.o:(+x.k||0);
-function itemsOf(L){const it=(L&&L.items)||{};return Object.keys(it).filter(k=>it[k]&&typeof it[k]==='object').map(k=>Object.assign({},it[k],{k})).sort((a,b)=>ord(a)-ord(b));}
+function itemsObj(L){const it=(L&&L.items)||{};const o={};Object.keys(it).forEach(k=>{if(it[k]&&typeof it[k]==='object')o[k]=it[k];});return o;}
+function itemsOf(L){const it=itemsObj(L);return Object.keys(it).filter(k=>!it[k].del).map(k=>Object.assign({},it[k],{k})).sort((a,b)=>ord(a)-ord(b));}
 function stats(L){const it=itemsOf(L),n=it.length,b=it.filter(x=>x.d);const d=b.length;return{n,d,p:n?Math.round(d*100/n):0,total:b.reduce((s,x)=>s+(+x.p||0),0)};}
-function listsArr(){return Object.keys(R.lists||{}).map(id=>Object.assign({},R.lists[id],{id})).filter(L=>L.title);}
+function listsArr(){return Object.keys(R.lists||{}).map(id=>Object.assign({},R.lists[id],{id})).filter(L=>L.title&&!L.del);}
 const activeLists=()=>listsArr().filter(L=>!L.archived).sort((a,b)=>(b.created||0)-(a.created||0));
 const archLists=()=>listsArr().filter(L=>L.archived).sort((a,b)=>(b.archived.at||0)-(a.archived.at||0));
 const getL=id=>R.lists&&R.lists[id];
+function fixItems(L){if(L&&(Array.isArray(L.items)||!L.items))L.items=itemsObj(L);return L;}
+
+/* ===== الدمج: آخر تعديل يكسب (لكل صنف ولبيانات القائمة) ===== */
+// عند التساوي يُفضَّل الطرف الثاني b (البيانات الواردة)
+const newer=(a,b)=>(b.u||0)>=(a.u||0)?b:a;
+function mergeList(a,b){
+  if(!a)return clone(b);if(!b)return clone(a);
+  const meta=newer(a,b),out={};
+  Object.keys(meta).forEach(k=>{if(k!=='items')out[k]=clone(meta[k]);});
+  const ai=itemsObj(a),bi=itemsObj(b);out.items={};
+  new Set([...Object.keys(ai),...Object.keys(bi)]).forEach(k=>{
+    const x=ai[k],y=bi[k];out.items[k]=clone(!x?y:!y?x:newer(x,y));
+  });
+  return out;
+}
+// تمثيل ثابت للمقارنة (مفاتيح مرتبة، المصفوفات ككائنات)
+function canon(v){
+  if(v===null||typeof v!=='object')return JSON.stringify(v);
+  const o=Array.isArray(v)?Object.assign({},v):v;
+  // الخادم يحذف القيم الفارغة والكائنات الفارغة، فنتجاهلها في المقارنة
+  return '{'+Object.keys(o).filter(k=>o[k]!==null&&o[k]!==undefined).sort().map(k=>[k,canon(o[k])]).filter(x=>x[1]!=='{}').map(x=>JSON.stringify(x[0])+':'+x[1]).join(',')+'}';
+}
 function setAt(path,val){
   const p=path.split('/').filter(Boolean);
-  if(!p.length){R=Object.assign({lists:{},members:{}},val||{});return;}
-  let o=R;for(let i=0;i<p.length-1;i++){if(typeof o[p[i]]!=='object'||o[p[i]]===null)o[p[i]]={};o=o[p[i]];}
+  if(!p.length){RT=Object.assign({lists:{},members:{}},val||{});return;}
+  let o=RT;for(let i=0;i<p.length-1;i++){if(typeof o[p[i]]!=='object'||o[p[i]]===null)o[p[i]]={};o=o[p[i]];}
   if(val===null)delete o[p[p.length-1]];else o[p[p.length-1]]=val;
-  if(!R.lists)R.lists={};if(!R.members)R.members={};
+  if(!RT.lists)RT.lists={};if(!RT.members)RT.members={};
+}
+// دمج صورة الخادم في الحالة المحلية
+function reconcile(){
+  R.members=clone(RT.members||{});
+  const ids=new Set([...Object.keys(RT.lists||{}),...Object.keys(R.lists||{})]);
+  ids.forEach(id=>{
+    const r=RT.lists[id],l=R.lists[id];
+    if(r&&l){const m=mergeList(l,r);if(canon(m)!==canon(r))S.dirty[id]=1;else delete S.dirty[id];R.lists[id]=m;}
+    else if(r){R.lists[id]=clone(r);}
+    else if(l&&!S.dirty[id]){delete R.lists[id];}
+  });
 }
 
-/* ===== الاتصال الحي ===== */
+/* ===== الحفظ والإرسال ===== */
 async function api(method,path,body){
   const r=await fetch(DB+'/rooms/'+S.room+path+'.json',{method,body:body===undefined?undefined:JSON.stringify(body)});
   if(!r.ok)throw new Error('HTTP '+r.status);
   return r.json();
 }
-// تعديل محلي فوري + إرسال للخادم، مع التراجع عند الفشل
-async function write(method,path,body,localApply){
-  const snap=JSON.stringify(R.lists);
-  if(localApply){localApply();save();render();}
-  try{await api(method,path,body);return true;}
-  catch(e){R.lists=JSON.parse(snap);save();render();toast('⚠️ تعذّر الحفظ — تحقق من الإنترنت');return false;}
+// كل تعديل: يُطبَّق محلياً فوراً، ثم يُرسل للخادم وللبلوثوث (أو يُنتظر حتى يتوفر الاتصال)
+function commit(ids){
+  ids.forEach(id=>{S.dirty[id]=1;btSendList(id);});
+  save();render();pushDirty();
 }
-function setNet(v){online=v;$('net').classList.toggle('on',v);$('net').title=v?'متصل':'غير متصل';}
+const pushing={};
+async function pushList(id){
+  if(pushing[id]||!S.room)return;pushing[id]=1;
+  try{
+    const remote=await api('GET','/lists/'+id);
+    const local=R.lists[id];if(!local){delete S.dirty[id];return;}
+    const m=remote?mergeList(local,remote):clone(local);
+    await api('PUT','/lists/'+id,m);
+    R.lists[id]=m;RT.lists[id]=clone(m);delete S.dirty[id];save();
+  }catch(e){}finally{delete pushing[id];}
+}
+async function pushDirty(){
+  if(!S.room)return;
+  const ids=Object.keys(S.dirty);if(!ids.length)return;
+  await Promise.all(ids.map(pushList));
+  updatePend();
+}
+function updatePend(){const n=Object.keys(S.dirty).length;const p=$('pend');if(p){p.hidden=!n;p.title=n+' تعديل بانتظار الإرسال للإنترنت';}}
+setInterval(()=>{pushDirty();},20000);
+window.addEventListener('online',()=>{pushDirty();if(!es||es.readyState===2)connect();});
+
+function setNet(v){online=v;$('net').classList.toggle('on',v);$('net').title=v?'متصل بالإنترنت':'غير متصل بالإنترنت';}
 function connect(){
   if(es){es.close();es=null;}
   if(!S.room)return;
-  firstSync=false;prev=null;
+  firstSync=false;prev=null;streamReady=false;
   es=new EventSource(DB+'/rooms/'+S.room+'.json');
-  es.onopen=()=>setNet(true);
+  es.onopen=()=>{setNet(true);};
   es.onerror=()=>setNet(false);
   const handle=(type)=>e=>{
     let m;try{m=JSON.parse(e.data);}catch(_){return;}
@@ -217,8 +281,9 @@ function connect(){
     if(type==='put')setAt(m.path,m.data);
     else if(m.data&&typeof m.data==='object')for(const k in m.data)setAt(m.path.replace(/\/$/,'')+'/'+k,m.data[k]);
     setNet(true);
-    detectChanges();
-    save();render();
+    if(type==='put'&&(m.path==='/'||m.path===''))streamReady=true;
+    if(!streamReady)return;
+    reconcile();detectChanges();save();render();pushDirty();
   };
   es.addEventListener('put',handle('put'));
   es.addEventListener('patch',handle('patch'));
@@ -227,7 +292,71 @@ function connect(){
 }
 function heartbeat(){if(S.room&&S.me)api('PATCH','/members/'+S.id,{name:S.me,seen:Date.now()}).catch(()=>{});}
 setInterval(heartbeat,60000);
-document.addEventListener('visibilitychange',()=>{if(!document.hidden){heartbeat();if(!es||es.readyState===2)connect();}});
+document.addEventListener('visibilitychange',()=>{if(!document.hidden){heartbeat();pushDirty();if(!es||es.readyState===2)connect();}});
+
+/* ===== البلوثوث (داخل تطبيق APK فقط) ===== */
+window.BT={
+  _state(st,name){
+    BTS.state=st;BTS.peer=name||BTS.peer;
+    if(st==='connected'){BTS.synced=false;btSend({t:'hello',room:S.room,name:S.me,id:S.id});toast('🔵 متصل بلوثوث بـ '+(name||'الجهاز'));}
+    if(st==='disconnected'||st==='off'){if(BTS.synced)toast('البلوثوث: انقطع الاتصال');BTS.synced=false;}
+    if(st==='failed')toast('❌ تعذّر الاتصال بالبلوثوث — تأكد أن البرنامج مفتوح على الجهاز الآخر');
+    paintBT();
+  },
+  _msg(line){let m;try{m=JSON.parse(line);}catch(e){return;}btReceive(m);},
+  _devices(json){let d=[];try{d=JSON.parse(json);}catch(e){}showDevices(d);}
+};
+function btSend(o){if(NATIVE&&BTS.state==='connected')try{AndroidBT.send(JSON.stringify(o));}catch(e){}}
+function btSendList(id){if(BTS.synced&&R.lists[id])btSend({t:'list',id,list:R.lists[id]});}
+function btReceive(m){
+  if(m.t==='hello'){
+    if(m.room&&m.room!==S.room){
+      if(!S.room||confirm('الجهاز الآخر ('+(m.name||'')+') مرتبط برابط مختلف. هل تريد الارتباط بنفس رابطه؟ (القوائم الحالية على هذا الجهاز لن تظهر)')){
+        S.room=m.room;R={lists:{},members:{}};RT={lists:{},members:{}};S.dirty={};save();connect();
+      }else{AndroidBT.disconnect();return;}
+    }else if(!m.room&&!S.room){toast('أنشئ الربط من هذا الجهاز: اضغط «اتصال عبر البلوثوث»');return;}
+    if(!m.room&&S.room)btSend({t:'hello',room:S.room,name:S.me,id:S.id});
+    BTS.synced=true;BTS.peer=m.name||BTS.peer;
+    btSend({t:'state',lists:R.lists});
+    paintBT();render();return;
+  }
+  if(!BTS.synced)return;
+  if(m.t==='state'){mergeIncoming(m.lists||{});toast('🔵 تمت المزامنة عبر البلوثوث');}
+  else if(m.t==='list'&&m.id){const x={};x[m.id]=m.list;mergeIncoming(x);}
+}
+function mergeIncoming(lists){
+  let changed=false;
+  Object.keys(lists).forEach(id=>{
+    const inc=lists[id];if(!inc)return;
+    const m=mergeList(R.lists[id],inc);
+    if(canon(m)!==canon(R.lists[id]||null)){R.lists[id]=m;changed=true;}
+    if(canon(m)!==canon(RT.lists[id]||null))S.dirty[id]=1;
+  });
+  if(changed){detectChanges();save();render();}
+  pushDirty();
+}
+function btConnectMenu(){
+  if(!NATIVE)return;
+  if(!S.me){askName(true);return;}
+  if(!S.room)createRoom(true);   // من يبدأ الاتصال ينشئ الربط، والجهاز الآخر يأخذه تلقائياً
+  try{AndroidBT.listDevices();}catch(e){toast('تعذّر قراءة الأجهزة');}
+}
+function showDevices(list){
+  $('sheetBody').innerHTML='<h3>🔵 اتصال عبر البلوثوث</h3>'+
+    '<div class="hint">اختر جوال الطرف الآخر. يجب أن يكون الجهازان <b>مقترنين</b> من إعدادات البلوثوث في الجوال، وأن يكون البرنامج مفتوحاً على الجهاز الآخر.</div>'+
+    (list.length?list.map(d=>'<button class="btn ghost" onclick="closeM(\'mSheet\');BTS.peer=\''+esc(d.name).replace(/'/g,'')+'\';toast(\'جارٍ الاتصال…\');AndroidBT.connect(\''+esc(d.address)+'\')">📱 '+esc(d.name||d.address)+'</button>').join('')
+      :'<div class="status">لا توجد أجهزة مقترنة. افتح إعدادات البلوثوث في الجوال واقرن جهاز الطرف الآخر أولاً.</div>')+
+    '<button class="btn ghost" onclick="AndroidBT.openSettings()">⚙️ إعدادات البلوثوث</button>'+
+    (BTS.state==='connected'?'<button class="btn danger" onclick="closeM(\'mSheet\');AndroidBT.disconnect()">قطع الاتصال</button>':'')+
+    '<button class="btn ghost" onclick="closeM(\'mSheet\')">إغلاق</button>';
+  openM('mSheet');
+}
+function paintBT(){
+  const b=$('btBtn');if(!b)return;
+  b.hidden=!NATIVE;
+  b.classList.toggle('on',BTS.state==='connected'&&BTS.synced);
+  b.title=BTS.state==='connected'?'متصل بلوثوث: '+(BTS.peer||''):'البلوثوث غير متصل';
+}
 
 /* ===== التنبيهات ===== */
 function detectChanges(){
@@ -245,7 +374,6 @@ function detectChanges(){
         if(!o&&x.byId&&x.byId!==S.id)notify('➕ '+(x.by||'الطرف الآخر')+' أضاف صنفاً',x.t+' — '+L.title);
         if(x.d&&!(o&&o.d)&&x.byId!==S.id)notify('🛒 '+(x.by||'الطرف الآخر')+' اشترى',x.t+(x.p?' — '+money(x.p):'')+' — '+L.title);
       });
-      if(L.archived&&!P.archived&&L.archived.byId!==S.id)notify('📦 '+(L.archived.by||'الطرف الآخر')+' أكمل الشراء',L.title+' — المجموع '+money(stats(L).total));
     }
   }
   prev=JSON.parse(JSON.stringify(cur));firstSync=true;
@@ -253,6 +381,7 @@ function detectChanges(){
 function notify(title,body){
   toast(title+': '+body);
   if(navigator.vibrate)navigator.vibrate([60,40,60]);
+  if(NATIVE){try{if(document.hidden)AndroidBT.notify(title,body);}catch(e){}return;}
   if(document.hidden&&'Notification' in window&&Notification.permission==='granted'){
     if(swReg)swReg.showNotification(title,{body,icon:'icon-192.png',badge:'icon-192.png',tag:'todo-'+Date.now(),dir:'rtl',lang:'ar'}).catch(()=>{});
     else try{new Notification(title,{body,icon:'icon-192.png'});}catch(e){}
@@ -263,22 +392,22 @@ async function enableNotif(){
   const p=await Notification.requestPermission();
   toast(p==='granted'?'🔔 تم تفعيل الإشعارات':'لم يتم السماح بالإشعارات');openSettings();
 }
-if('serviceWorker' in navigator&&/^https:$/.test(location.protocol))navigator.serviceWorker.register('sw.js').then(r=>swReg=r).catch(()=>{});
+if(!NATIVE&&'serviceWorker' in navigator&&/^https:$/.test(location.protocol))navigator.serviceWorker.register('sw.js').then(r=>swReg=r).catch(()=>{});
 
 /* ===== الربط بين الجهازين ===== */
-function createRoom(){S.room=rid(24);R={lists:{},members:{}};save();connect();render();openM('mSend');}
+function createRoom(silent){S.room=rid(24);R={lists:{},members:{}};RT={lists:{},members:{}};S.dirty={};save();connect();render();if(!silent)openM('mSend');}
 function joinRoom(code){
   const m=String(code).match(/room=([A-Za-z0-9]{20,})/)||String(code).trim().match(/^([A-Za-z0-9]{20,})$/);
   if(!m){toast('❌ رابط الربط غير صحيح');return false;}
   if(S.room===m[1]){toast('أنت مرتبط بهذا الرابط بالفعل');return true;}
   if(S.room&&!confirm('أنت مرتبط حالياً بطرف آخر. الانتقال إلى الرابط الجديد؟'))return false;
-  S.room=m[1];R={lists:{},members:{}};save();connect();UI.tab='lists';UI.open=null;render();toast('🔗 تم الربط بنجاح');return true;
+  S.room=m[1];R={lists:{},members:{}};RT={lists:{},members:{}};S.dirty={};save();connect();UI.tab='lists';UI.open=null;render();toast('🔗 تم الربط بنجاح');return true;
 }
 function leaveRoom(){if(!confirm('فك الربط على هذا الجهاز؟ (القوائم تبقى محفوظة في الربط ويمكن العودة بنفس الرابط)'))return;
-  if(es)es.close();es=null;api('DELETE','/members/'+S.id).catch(()=>{});S.room='';R={lists:{},members:{}};save();setNet(false);closeM('mSet');render();}
+  if(es)es.close();es=null;api('DELETE','/members/'+S.id).catch(()=>{});S.room='';R={lists:{},members:{}};RT={lists:{},members:{}};S.dirty={};save();setNet(false);closeM('mSet');render();}
 const pairMsg=()=>'🔗 رابط ربط «المهام المشتركة» من '+S.me+'\nافتحه على جوالك ليرتبط البرنامج بجهازي وتصلك القوائم تلقائياً:\n'+pairLink();
-function sendWA(){window.open('https://wa.me/?text='+encodeURIComponent(pairMsg()),'_blank');closeM('mSend');}
-async function sendShare(){try{await navigator.share({text:pairMsg()});closeM('mSend');}catch(e){}}
+function sendWA(){const u='https://wa.me/?text='+encodeURIComponent(pairMsg());if(NATIVE)location.href=u;else window.open(u,'_blank');closeM('mSend');}
+async function sendShare(){if(NATIVE){try{AndroidBT.share(pairMsg());}catch(e){}closeM('mSend');return;}try{await navigator.share({text:pairMsg()});closeM('mSend');}catch(e){}}
 async function sendCopy(){
   try{await navigator.clipboard.writeText(pairMsg());toast('📄 تم النسخ');}
   catch(e){const ta=document.createElement('textarea');ta.value=pairMsg();document.body.appendChild(ta);ta.select();try{document.execCommand('copy');toast('📄 تم النسخ');}catch(_){toast('تعذّر النسخ');}ta.remove();}
@@ -292,12 +421,16 @@ function openSettings(){
   const mem=R.members||{};
   const ml=Object.keys(mem).map(k=>{const x=mem[k]||{};const on=Date.now()-(x.seen||0)<90000;
     return '<div class="member"><span><span class="dot'+(on?' on':'')+'"></span>'+esc(x.name||'—')+(k===S.id?' (أنت)':'')+'</span><span class="meta" style="margin:0">'+(k===S.id?'هذا الجهاز':ago(x.seen||0))+'</span></div>';}).join('');
-  const np=('Notification' in window)?Notification.permission:'unsupported';
+  const np=NATIVE?'native':('Notification' in window)?Notification.permission:'unsupported';
+  const pend=Object.keys(S.dirty).length;
   $('setBody').innerHTML='<h3>الإعدادات</h3>'+
     '<label>الاسم</label><div class="row"><input value="'+esc(S.me)+'" disabled><button class="btn ghost" style="width:auto;margin:0;padding:11px 14px" onclick="closeM(\'mSet\');askName()">تعديل</button></div>'+
+    (NATIVE?'<label>البلوثوث</label><div class="status">'+(BTS.state==='connected'&&BTS.synced?'🔵 متصل بـ '+esc(BTS.peer||'الجهاز الآخر')+' — كل تعديل يُرسل فوراً':'⚪ غير متصل. القوائم محفوظة على الجهاز، وتُزامن عند الاتصال.')+'</div>'+
+      '<button class="btn" onclick="closeM(\'mSet\');btConnectMenu()">🔵 '+(BTS.state==='connected'?'إدارة اتصال البلوثوث':'اتصال عبر البلوثوث')+'</button>':'')+
+    '<label>الإنترنت</label><div class="status">'+(online?'🟢 متصل':'🔴 غير متصل')+(pend?' — '+pend+' قائمة بانتظار الإرسال':' — كل التعديلات مرسلة')+'</div>'+
     (S.room?'<label>الأجهزة المرتبطة</label><div class="card" style="margin:0;padding:6px 12px">'+(ml||'<div class="meta">لا يوجد</div>')+'</div>'+
       '<button class="btn wa" onclick="closeM(\'mSet\');openM(\'mSend\')">📤 إرسال رابط الربط للطرف الآخر</button>':'')+
-    (np==='granted'?'<div class="status">🔔 الإشعارات مفعّلة</div>':np==='unsupported'?'':'<button class="btn ghost" onclick="enableNotif()">🔔 تفعيل الإشعارات</button>')+
+    (np==='granted'||np==='native'?'':np==='unsupported'?'':'<button class="btn ghost" onclick="enableNotif()">🔔 تفعيل الإشعارات</button>')+
     (S.room?'<button class="btn danger" onclick="leaveRoom()">فك الربط على هذا الجهاز</button>':'')+
     '<button class="btn ghost" onclick="closeM(\'mSet\')">إغلاق</button>';
   openM('mSet');
@@ -306,27 +439,33 @@ function openSettings(){
 /* ===== التنقل ===== */
 function go(tab){UI.tab=tab;UI.open=null;render();scrollTo(0,0);}
 function openList(id){UI.open=id;S.seen[id]=1;save();render();scrollTo(0,0);}
+// زر الرجوع في أندرويد
+window.__back=function(){
+  for(const id of ['mSheet','mSet','mSend']){if($(id).classList.contains('show')){closeM(id);return true;}}
+  if(UI.open){go(UI.tab==='arch'?'arch':'lists');return true;}
+  if(UI.tab!=='lists'){go('lists');return true;}
+  return false;
+};
 
 /* ===== القوائم ===== */
-async function createList(){
+function createList(){
   const to=$('cTo').value.trim(),title=$('cTitle').value.trim();
   const lines=$('cItems').value.split('\n').map(x=>x.replace(/^\s*(\d+[\-\.\)]|[-•*])\s*/,'').trim()).filter(Boolean);
   if(!title){toast('اكتب عنوان القائمة');return;}
   if(!lines.length){toast('أضف صنفاً واحداً على الأقل');return;}
   const id=Date.now().toString(36)+rid(4),now=Date.now(),items={};
-  lines.forEach((t,i)=>{items['n'+now.toString(36)+i.toString(36).padStart(2,'0')+rid(2)]={t,d:0,o:now+i,byId:S.id,by:S.me};});
-  const L={title,from:S.me,fromId:S.id,to,created:now,items};
-  const b=$('cSend');b.disabled=true;b.textContent='جارٍ الإرسال…';
-  try{await api('PUT','/lists/'+id,L);R.lists[id]=L;S.seen[id]=1;save();UI.tab='lists';UI.open=id;render();toast('✅ وصلت القائمة للطرف الآخر');}
-  catch(e){b.disabled=false;b.textContent='📤 إرسال';toast('⚠️ تعذّر الإرسال — تحقق من الإنترنت');}
+  lines.forEach((t,i)=>{items['n'+now.toString(36)+i.toString(36).padStart(2,'0')+rid(2)]={t,d:0,o:now+i,byId:S.id,by:S.me,u:now};});
+  R.lists[id]={title,from:S.me,fromId:S.id,to,created:now,u:now,items};
+  S.seen[id]=1;UI.tab='lists';UI.open=id;
+  commit([id]);
+  toast(online||BTS.synced?'✅ أُرسلت القائمة للطرف الآخر':'💾 حُفظت القائمة — تُرسل عند توفر الإنترنت أو البلوثوث');
 }
-async function addItem(lid){
+function addItem(lid){
   const inp=$('addIn');const t=inp.value.trim();if(!t){inp.focus();return;}
-  const L=getL(lid);if(!L)return;
+  const L=fixItems(getL(lid));if(!L)return;
   const k='n'+Date.now().toString(36)+rid(3);
-  const it={t,d:0,o:Date.now(),byId:S.id,by:S.me};
-  inp.value='';
-  await write('PUT','/lists/'+lid+'/items/'+k,it,()=>{if(!L.items||Array.isArray(L.items))L.items=Object.assign({},L.items||{});L.items[k]=it;});
+  L.items[k]={t,d:0,o:Date.now(),byId:S.id,by:S.me,u:Date.now()};
+  inp.value='';commit([lid]);
   const n=$('addIn');if(n)n.focus();
 }
 function editTitle(lid){
@@ -341,20 +480,19 @@ function editTitle(lid){
 function saveTitle(lid){
   const t=$('eTitle').value.trim(),to=$('eTo').value.trim();if(!t){toast('اكتب العنوان');return;}
   const L=getL(lid);closeM('mSheet');
-  write('PATCH','/lists/'+lid,{title:t,to},()=>{L.title=t;L.to=to;});
+  L.title=t;L.to=to;L.u=Date.now();commit([lid]);
 }
-async function delList(id){
+function delList(id){
   const L=getL(id);if(!L)return;
   if(!confirm('حذف القائمة «'+L.title+'» نهائياً؟ ستُحذف عند الطرفين.'+(L.archived?'':' (النسخ المحفوظة في الأرشيف تبقى)')))return;
-  try{await api('DELETE','/lists/'+id);delete R.lists[id];save();UI.open=null;render();toast('🗑 تم الحذف');}
-  catch(e){toast('⚠️ تعذّر الحذف — تحقق من الإنترنت');}
+  L.del=Date.now();L.u=L.del;UI.open=null;commit([id]);toast('🗑 تم الحذف');
 }
 
-/* ===== الصنف: شراء / سعر / تعديل / حذف ===== */
+/* ===== الصنف ===== */
 const isSender=L=>L.fromId===S.id;   // المُرسِل يكتب القائمة ويعدّلها، والطرف الآخر يشتري
 function openItem(lid,k){
   const L=getL(lid);if(!L||L.archived)return;
-  const it=L.items&&L.items[k];if(!it)return;
+  const it=itemsObj(L)[k];if(!it)return;
   const done=!!it.d;
   if(isSender(L)){
     $('sheetBody').innerHTML='<h3>✏️ تعديل صنف</h3>'+
@@ -381,7 +519,7 @@ function openItem(lid,k){
   setTimeout(()=>pi.focus(),250);
 }
 function saveItem(lid,k,mode){
-  const L=getL(lid);if(!L)return;const it=L.items&&L.items[k];if(!it)return;
+  const L=fixItems(getL(lid));if(!L)return;const it=L.items[k];if(!it)return;
   let patch;
   if(mode==='rename'){
     const t=$('iName').value.trim();if(!t){toast('اكتب اسم الصنف');return;}
@@ -394,13 +532,13 @@ function saveItem(lid,k,mode){
   }
   closeM('mSheet');
   if(navigator.vibrate)navigator.vibrate(mode==='buy'?35:15);
-  write('PATCH','/lists/'+lid+'/items/'+k,patch,()=>Object.assign(it,patch));
+  Object.assign(it,patch,{u:Date.now()});commit([lid]);
 }
 function delItem(lid,k){
-  const L=getL(lid);if(!L)return;const it=L.items&&L.items[k];if(!it)return;
+  const L=fixItems(getL(lid));if(!L)return;const it=L.items[k];if(!it)return;
   if(!confirm('حذف الصنف «'+it.t+'»؟'))return;
   closeM('mSheet');
-  write('DELETE','/lists/'+lid+'/items/'+k,undefined,()=>{delete L.items[k];});
+  it.del=Date.now();it.u=it.del;commit([lid]);
 }
 
 /* ===== الأرشفة ===== */
@@ -414,19 +552,18 @@ function askArchive(lid){
     '<button class="btn ghost" onclick="closeM(\'mSheet\')">رجوع</button>';
   openM('mSheet');
 }
-async function doArchive(lid){
-  const L=getL(lid);if(!L)return;const s=stats(L);
+function doArchive(lid){
+  const L=fixItems(getL(lid));if(!L)return;const s=stats(L);
   const now=Date.now(),a={at:now,by:S.me,byId:S.id,total:s.total,bought:s.d,count:s.n};
   const aid=lid+'_a'+now.toString(36);
-  const copy=JSON.parse(JSON.stringify(L));copy.archived=a;copy.srcId=lid;delete copy.lastArch;
-  closeM('mSheet');
-  // 1) نسخة في الأرشيف
-  if(!await write('PUT','/lists/'+aid,copy,()=>{R.lists[aid]=copy;}))return;
-  // 2) تصفير القائمة النشطة: نفس الأصناف بدون شراء ولا أسعار
-  const reset={lastArch:now};
-  itemsOf(L).forEach(x=>{reset['items/'+x.k+'/d']=0;reset['items/'+x.k+'/p']=0;});
-  await write('PATCH','/lists/'+lid,reset,()=>{L.lastArch=now;itemsOf(L).forEach(x=>{const it=L.items[x.k];it.d=0;it.p=0;});});
-  render();toast('📦 حُفظت في الأرشيف — المجموع '+money(s.total)+' — وصُفّرت القائمة');
+  const copy=clone(L);copy.archived=a;copy.srcId=lid;copy.u=now;delete copy.lastArch;
+  Object.keys(copy.items).forEach(k=>{if(copy.items[k].del)delete copy.items[k];});
+  R.lists[aid]=copy;
+  // تصفير القائمة النشطة: نفس الأصناف بدون شراء ولا أسعار
+  Object.keys(L.items).forEach(k=>{const it=L.items[k];if(!it.del){it.d=0;it.p=0;it.u=now;}});
+  L.lastArch=now;L.u=now;
+  closeM('mSheet');commit([aid,lid]);
+  toast('📦 حُفظت في الأرشيف — المجموع '+money(s.total)+' — وصُفّرت القائمة');
 }
 
 /* ===== فلتر الأرشيف ===== */
@@ -457,7 +594,7 @@ function itemHTML(L,x,i,arch){
 }
 function listCards(arr,arch){
   return arr.map(L=>{const isNew=!arch&&L.fromId!==S.id&&!S.seen[L.id];const s=stats(L);
-    return '<div class="card click'+(isNew?' new':'')+'" onclick="openList(\''+L.id+'\')"><div class="row between"><span class="title">'+esc(L.title)+(isNew?'<span class="tag">جديد</span>':'')+'</span>'+
+    return '<div class="card click'+(isNew?' new':'')+'" onclick="openList(\''+L.id+'\')"><div class="row between"><span class="title">'+esc(L.title)+(isNew?'<span class="tag">جديد</span>':'')+(S.dirty[L.id]?' <span title="بانتظار الإرسال">⏳</span>':'')+'</span>'+
       (arch?'<span class="money">'+money(s.total)+'</span>':fracTag(L))+'</div>'+
       '<div class="meta">'+(arch?'📦 '+fmtDay(L.archived.at)+' · '+esc(L.archived.by||'')+' · '+s.d+' من '+s.n+' صنف':(isSender(L)?'📤 أرسلتها'+(L.to?' إلى '+esc(L.to):''):'🛒 للشراء — من '+esc(L.from))+' · '+fmtD(L.created)+(s.total?' · <span class="money">'+money(s.total)+'</span>':''))+'</div>'+
       (arch?'':progress(L))+'</div>';}).join('');
@@ -465,8 +602,9 @@ function listCards(arr,arch){
 function pairScreen(){
   $('nav').style.display='none';
   $('main').innerHTML='<div class="card"><div class="title">🔗 ربط الجهازين</div>'+
-    '<div class="hint">يُربط جهازك بجهاز الطرف الآخر مرة واحدة فقط، وبعدها تصل القوائم وتتحدّث فوراً عند الطرفين دون أي رسائل.</div>'+
-    '<button class="btn wa" onclick="createRoom()">إنشاء رابط ربط وإرساله للطرف الآخر</button></div>'+
+    '<div class="hint">يُربط جهازك بجهاز الطرف الآخر مرة واحدة فقط، وبعدها تصل القوائم وتتحدّث عند الطرفين.</div>'+
+    (NATIVE?'<button class="btn" onclick="btConnectMenu()">🔵 ربط عبر البلوثوث (بدون إنترنت)</button>':'')+
+    '<button class="btn wa" onclick="createRoom()">إنشاء رابط ربط وإرساله عبر واتساب</button></div>'+
     '<div class="card"><div class="title">لديك رابط ربط؟</div>'+
     '<div class="hint">افتح الرابط الذي وصلك مباشرة، أو الصقه هنا:</div>'+
     '<input id="joinIn" placeholder="الصق رابط الربط هنا" style="margin-top:10px" dir="ltr">'+
@@ -483,6 +621,7 @@ function paint(html){
 }
 function render(){
   $('meBtn').textContent='⚙️ '+(S.me||'الإعدادات');
+  paintBT();updatePend();
   if(!S.room){pairScreen();return;}
   $('nav').style.display='flex';
   document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.tab===UI.tab));
@@ -492,7 +631,7 @@ function render(){
 
   if(UI.open){
     const L=getL(UI.open);
-    if(!L){UI.open=null;return render();}
+    if(!L||L.del){UI.open=null;return render();}
     const Lx=Object.assign({},L,{id:UI.open}),s=stats(Lx),arch=!!L.archived,items=itemsOf(Lx),snd=isSender(L);
     const role=arch?'':snd?'<div class="status">📤 أنت مُرسِل هذه القائمة: تضيف الأصناف وتعدّلها، و'+esc(L.to||'الطرف الآخر')+' يشتريها. ترى كل شراء وثمنه فوراً.</div>'
                          :'<div class="status">🛒 أنت المشتري: اضغط على الصنف عند شرائه واكتب ثمنه، ثم «تم» عند انتهاء التسوق.</div>';
@@ -501,6 +640,7 @@ function render(){
       (!arch&&snd?'<button class="ibtn" title="تعديل" onclick="editTitle(\''+Lx.id+'\')">✏️</button>':'')+'</div>'+
       '<div class="meta">من: '+esc(L.from)+(L.to?' ← '+esc(L.to):'')+' · '+fmtD(L.created)+(L.lastArch&&!arch?' · آخر أرشفة '+fmtD(L.lastArch):'')+'</div>'+
       (arch?'<div class="status">📦 أُكملت في '+fmtD(L.archived.at)+' بواسطة '+esc(L.archived.by||'')+' — تم شراء '+s.d+' من '+s.n+'</div>':progress(Lx)+role)+
+      (S.dirty[Lx.id]?'<div class="hint">⏳ هذه التعديلات محفوظة على الجهاز وتُرسل عند توفر الإنترنت'+(NATIVE?' أو البلوثوث':'')+'.</div>':'')+
       '<div class="totbox"><span>المجموع'+(arch?'':' حتى الآن')+'</span><b>'+money(s.total)+'</b></div>'+
       '</div>';
     h+=items.map((x,i)=>itemHTML(Lx,x,i,arch)).join('')||'<div class="empty" style="padding:20px">لا توجد أصناف</div>';
@@ -543,7 +683,7 @@ function render(){
   let h='<div class="title" style="margin-bottom:12px">القوائم النشطة</div>';
   if(!act.length){
     const others=Object.keys(R.members||{}).filter(k=>k!==S.id).length;
-    h+='<div class="empty"><b>📭</b>لا توجد قوائم نشطة.<br>'+(others?'أنشئ قائمة جديدة أو انتظر قائمة من الطرف الآخر.<br><button class="btn" style="width:auto;padding:10px 16px" onclick="go(\'new\')">➕ قائمة جديدة</button>':'الطرف الآخر لم يرتبط بعد.<br><button class="btn wa" style="width:auto;padding:10px 16px" onclick="openM(\'mSend\')">📤 إرسال رابط الربط</button>')+'</div>';
+    h+='<div class="empty"><b>📭</b>لا توجد قوائم نشطة.<br>'+(others||BTS.synced?'أنشئ قائمة جديدة أو انتظر قائمة من الطرف الآخر.<br><button class="btn" style="width:auto;padding:10px 16px" onclick="go(\'new\')">➕ قائمة جديدة</button>':'الطرف الآخر لم يرتبط بعد.<br><button class="btn wa" style="width:auto;padding:10px 16px" onclick="openM(\'mSend\')">📤 إرسال رابط الربط</button>'+(NATIVE?'<br><button class="btn" style="width:auto;padding:10px 16px" onclick="btConnectMenu()">🔵 أو اتصل عبر البلوثوث</button>':''))+'</div>';
   }else h+=listCards(act,false);
   paint(h);
 }
@@ -563,6 +703,8 @@ save();render();
 if(!S.me)askName(true);
 fromHash();
 connect();
+pushDirty();
+if(NATIVE)try{AndroidBT.ready();}catch(e){}
 </script>
 </body>
 </html>
