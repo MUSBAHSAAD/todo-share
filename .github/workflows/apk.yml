@@ -264,6 +264,12 @@ jobs:
                   }
               }
 
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  if (bt != null) bt.startServer();
+              }
+
               @SuppressWarnings("deprecation")
               @Override
               public void onBackPressed() {
@@ -391,7 +397,7 @@ jobs:
                   if (adapter == null || !hasPerm() || server != null) return;
                   try {
                       if (!adapter.isEnabled()) return;
-                      server = adapter.listenUsingRfcommWithServiceRecord("TodoShare", SERVICE_UUID);
+                      server = adapter.listenUsingInsecureRfcommWithServiceRecord("TodoShare", SERVICE_UUID);
                   } catch (IOException | SecurityException e) {
                       server = null;
                       return;
@@ -537,21 +543,47 @@ jobs:
               public void connect(final String address) {
                   if (adapter == null || !hasPerm()) return;
                   Thread t = new Thread(() -> {
+                      // في أندرويد 12+ يحتاج إيقاف البحث إذن BLUETOOTH_SCAN، لذلك نتجاهل خطأه ولا نوقف الاتصال
                       try {
                           if (adapter.isDiscovering()) adapter.cancelDiscovery();
+                      } catch (SecurityException ignored) {
+                      }
+                      String err = "";
+                      BluetoothSocket s = null;
+                      try {
                           BluetoothDevice dev = adapter.getRemoteDevice(address);
-                          BluetoothSocket s = dev.createRfcommSocketToServiceRecord(SERVICE_UUID);
-                          s.connect();
-                          synchronized (BtBridge.this) {
-                              if (sock != null) {
-                                  try { sock.close(); } catch (IOException ignored) { }
-                                  sock = null;
+                          // محاولات: غير مشفّر ثم مشفّر، مرتين لكل نوع (أول محاولة تفشل أحياناً بسبب ذاكرة SDP)
+                          for (int i = 0; i < 4 && s == null; i++) {
+                              BluetoothSocket c = null;
+                              try {
+                                  c = (i % 2 == 0)
+                                          ? dev.createInsecureRfcommSocketToServiceRecord(SERVICE_UUID)
+                                          : dev.createRfcommSocketToServiceRecord(SERVICE_UUID);
+                                  c.connect();
+                                  s = c;
+                              } catch (IOException e) {
+                                  err = e.getMessage() == null ? e.toString() : e.getMessage();
+                                  if (c != null) {
+                                      try { c.close(); } catch (IOException ignored) { }
+                                  }
+                                  try { Thread.sleep(700); } catch (InterruptedException ignored) { }
                               }
                           }
-                          onConnected(s);
                       } catch (Exception e) {
-                          js("_state", "failed", "");
+                          err = e.toString();
                       }
+                      if (s == null) {
+                          js("_state", "failed", "");
+                          toast("سبب الفشل: " + err);
+                          return;
+                      }
+                      synchronized (BtBridge.this) {
+                          if (sock != null) {
+                              try { sock.close(); } catch (IOException ignored) { }
+                              sock = null;
+                          }
+                      }
+                      onConnected(s);
                   }, "bt-connect");
                   t.setDaemon(true);
                   t.start();
