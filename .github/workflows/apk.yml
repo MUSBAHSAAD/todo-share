@@ -1,0 +1,653 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Create Android project
+        run: |
+          mkdir -p android/app/src/main/java/ly/musbah/todoshare android/app/src/main/assets android/app/src/main/res/mipmap-xxxhdpi
+          cat > android/settings.gradle <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "TodoShare"
+          include ':app'
+          EOF_FILE
+          cat > android/build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF_FILE
+          cat > android/gradle.properties <<'EOF_FILE'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          EOF_FILE
+          cat > android/app/build.gradle <<'EOF_FILE'
+          plugins {
+              id 'com.android.application'
+          }
+          def runNo = (System.getenv('GITHUB_RUN_NUMBER') ?: '1') as Integer
+          android {
+              namespace 'ly.musbah.todoshare'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'ly.musbah.todoshare'
+                  minSdk 23
+                  targetSdk 34
+                  versionCode runNo
+                  versionName "1.0." + runNo
+              }
+              signingConfigs {
+                  release {
+                      storeFile file('release.p12')
+                      storePassword 'todoshare'
+                      keyAlias 'todoshare'
+                      keyPassword 'todoshare'
+                      storeType 'pkcs12'
+                  }
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.release
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          dependencies {
+              implementation 'androidx.webkit:webkit:1.11.0'
+          }
+          EOF_FILE
+          cat > android/app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+
+              <application
+                  android:label="المهام المشتركة"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:supportsRtl="true"
+                  android:allowBackup="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.VIEW" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.BROWSABLE" />
+                          <data android:scheme="https" android:host="musbahsaad.github.io" android:pathPrefix="/todo-share" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          cat > android/app/src/main/java/ly/musbah/todoshare/MainActivity.java <<'EOF_FILE'
+          package ly.musbah.todoshare;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          import androidx.webkit.WebViewAssetLoader;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class MainActivity extends Activity {
+
+              static final String HOST = "appassets.androidplatform.net";
+              static final String BASE = "https://" + HOST + "/assets/index.html";
+
+              private WebView web;
+              private BtBridge bt;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().setStatusBarColor(Color.parseColor("#4B5320"));
+
+                  web = new WebView(this);
+                  setContentView(web);
+
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setDatabaseEnabled(true);
+                  s.setJavaScriptCanOpenWindowsAutomatically(true);
+                  s.setSupportMultipleWindows(false);
+                  s.setAllowFileAccess(false);
+
+                  final WebViewAssetLoader loader = new WebViewAssetLoader.Builder()
+                          .setDomain(HOST)
+                          .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
+                          .build();
+
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                          return loader.shouldInterceptRequest(request.getUrl());
+                      }
+
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                          Uri u = request.getUrl();
+                          if (HOST.equals(u.getHost())) return false;
+                          String frag = u.getFragment();
+                          if ("musbahsaad.github.io".equals(u.getHost()) && frag != null && frag.startsWith("room=")) {
+                              openRoom(frag);
+                              return true;
+                          }
+                          try {
+                              startActivity(new Intent(Intent.ACTION_VIEW, u));
+                          } catch (Exception ignored) {
+                          }
+                          return true;
+                      }
+                  });
+                  web.setWebChromeClient(new WebChromeClient());
+
+                  bt = new BtBridge(this, web);
+                  web.addJavascriptInterface(bt, "AndroidBT");
+
+                  String frag = roomFragment(getIntent());
+                  web.loadUrl(BASE + (frag != null ? "#" + frag : ""));
+
+                  requestNeededPermissions();
+              }
+
+              private String roomFragment(Intent intent) {
+                  if (intent == null || intent.getData() == null) return null;
+                  String f = intent.getData().getFragment();
+                  return (f != null && f.startsWith("room=")) ? f : null;
+              }
+
+              private void openRoom(String frag) {
+                  String safe = frag.replaceAll("[^A-Za-z0-9=]", "");
+                  web.evaluateJavascript("location.hash='" + safe + "'", null);
+              }
+
+              @Override
+              protected void onNewIntent(Intent intent) {
+                  super.onNewIntent(intent);
+                  String frag = roomFragment(intent);
+                  if (frag != null) openRoom(frag);
+              }
+
+              void requestNeededPermissions() {
+                  List<String> need = new ArrayList<>();
+                  if (Build.VERSION.SDK_INT >= 31
+                          && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                      need.add(Manifest.permission.BLUETOOTH_CONNECT);
+                  }
+                  if (Build.VERSION.SDK_INT >= 33
+                          && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                      need.add(Manifest.permission.POST_NOTIFICATIONS);
+                  }
+                  if (!need.isEmpty()) {
+                      requestPermissions(need.toArray(new String[0]), 1);
+                  } else {
+                      bt.startServer();
+                  }
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  bt.startServer();
+                  bt.reportState();
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode == BtBridge.REQ_ENABLE) {
+                      bt.startServer();
+                      bt.reportState();
+                  }
+              }
+
+              @SuppressWarnings("deprecation")
+              @Override
+              public void onBackPressed() {
+                  web.evaluateJavascript("(window.__back&&window.__back())?'1':'0'", value -> {
+                      if (value == null || !value.contains("1")) moveTaskToBack(true);
+                  });
+              }
+
+              @Override
+              protected void onDestroy() {
+                  bt.shutdown();
+                  web.destroy();
+                  super.onDestroy();
+              }
+          }
+          EOF_FILE
+          cat > android/app/src/main/java/ly/musbah/todoshare/BtBridge.java <<'EOF_FILE'
+          package ly.musbah.todoshare;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.bluetooth.BluetoothAdapter;
+          import android.bluetooth.BluetoothDevice;
+          import android.bluetooth.BluetoothManager;
+          import android.bluetooth.BluetoothServerSocket;
+          import android.bluetooth.BluetoothSocket;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.IntentFilter;
+          import android.content.pm.PackageManager;
+          import android.os.Build;
+          import android.provider.Settings;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import android.widget.Toast;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.io.BufferedReader;
+          import java.io.IOException;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.nio.charset.StandardCharsets;
+          import java.util.Set;
+          import java.util.UUID;
+
+          /**
+           * جسر البلوثوث بين صفحة البرنامج وأندرويد.
+           * كل جهاز يستمع دائماً (خادم RFCOMM)، وأي جهاز يمكنه الاتصال بالآخر من قائمة الأجهزة المقترنة.
+           * الرسائل نصوص JSON، كل رسالة في سطر واحد.
+           */
+          public class BtBridge {
+
+              static final UUID SERVICE_UUID = UUID.fromString("5f3c1a2e-9b7d-4e61-8a0c-2d4f6b8e9a17");
+              static final int REQ_ENABLE = 7;
+              private static final String CHANNEL = "todo_share";
+
+              private final Activity act;
+              private final WebView web;
+              private final BluetoothAdapter adapter;
+
+              private BluetoothServerSocket server;
+              private BluetoothSocket sock;
+              private OutputStream out;
+              private volatile boolean alive = true;
+              private String peerName = "";
+              private int notifId = 100;
+
+              private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
+                  @Override
+                  public void onReceive(Context context, Intent intent) {
+                      int st = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR);
+                      if (st == BluetoothAdapter.STATE_ON) {
+                          startServer();
+                      } else if (st == BluetoothAdapter.STATE_TURNING_OFF || st == BluetoothAdapter.STATE_OFF) {
+                          closeServer();
+                          closeSock();
+                          js("_state", "off", "");
+                      }
+                  }
+              };
+
+              BtBridge(Activity act, WebView web) {
+                  this.act = act;
+                  this.web = web;
+                  BluetoothManager bm = (BluetoothManager) act.getSystemService(Context.BLUETOOTH_SERVICE);
+                  this.adapter = bm != null ? bm.getAdapter() : null;
+                  act.registerReceiver(stateReceiver, new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED));
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationManager nm = (NotificationManager) act.getSystemService(Context.NOTIFICATION_SERVICE);
+                      if (nm != null) {
+                          nm.createNotificationChannel(new NotificationChannel(CHANNEL, "المهام المشتركة", NotificationManager.IMPORTANCE_DEFAULT));
+                      }
+                  }
+              }
+
+              private boolean hasPerm() {
+                  return Build.VERSION.SDK_INT < 31
+                          || act.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED;
+              }
+
+              private void js(String fn, String... args) {
+                  StringBuilder sb = new StringBuilder("window.BT&&BT.").append(fn).append('(');
+                  for (int i = 0; i < args.length; i++) {
+                      if (i > 0) sb.append(',');
+                      sb.append(JSONObject.quote(args[i] == null ? "" : args[i]));
+                  }
+                  sb.append(')');
+                  final String code = sb.toString();
+                  act.runOnUiThread(() -> web.evaluateJavascript(code, null));
+              }
+
+              private void toast(final String msg) {
+                  act.runOnUiThread(() -> Toast.makeText(act, msg, Toast.LENGTH_LONG).show());
+              }
+
+              // ===== الخادم: ينتظر اتصال الجهاز الآخر =====
+              synchronized void startServer() {
+                  if (adapter == null || !hasPerm() || server != null) return;
+                  try {
+                      if (!adapter.isEnabled()) return;
+                      server = adapter.listenUsingRfcommWithServiceRecord("TodoShare", SERVICE_UUID);
+                  } catch (IOException | SecurityException e) {
+                      server = null;
+                      return;
+                  }
+                  final BluetoothServerSocket srv = server;
+                  Thread t = new Thread(() -> {
+                      while (alive) {
+                          try {
+                              BluetoothSocket s = srv.accept();
+                              if (s == null) continue;
+                              synchronized (BtBridge.this) {
+                                  if (sock != null) {
+                                      try { s.close(); } catch (IOException ignored) { }
+                                      continue;
+                                  }
+                              }
+                              onConnected(s);
+                          } catch (IOException e) {
+                              break;
+                          }
+                      }
+                      synchronized (BtBridge.this) {
+                          if (server == srv) server = null;
+                      }
+                  }, "bt-accept");
+                  t.setDaemon(true);
+                  t.start();
+              }
+
+              private synchronized void closeServer() {
+                  if (server != null) {
+                      try { server.close(); } catch (IOException ignored) { }
+                      server = null;
+                  }
+              }
+
+              // ===== الاتصال القائم =====
+              private void onConnected(final BluetoothSocket s) {
+                  try {
+                      synchronized (this) {
+                          sock = s;
+                          out = s.getOutputStream();
+                      }
+                  } catch (IOException e) {
+                      closeSock();
+                      return;
+                  }
+                  try {
+                      peerName = s.getRemoteDevice().getName();
+                  } catch (SecurityException e) {
+                      peerName = "";
+                  }
+                  js("_state", "connected", peerName);
+                  Thread reader = new Thread(() -> {
+                      try {
+                          BufferedReader br = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+                          String line;
+                          while ((line = br.readLine()) != null) {
+                              if (!line.isEmpty()) js("_msg", line);
+                          }
+                      } catch (IOException ignored) {
+                      } finally {
+                          boolean wasCurrent;
+                          synchronized (BtBridge.this) {
+                              wasCurrent = (sock == s);
+                          }
+                          if (wasCurrent) {
+                              closeSock();
+                              js("_state", "disconnected", "");
+                          }
+                          startServer();
+                      }
+                  }, "bt-read");
+                  reader.setDaemon(true);
+                  reader.start();
+              }
+
+              private synchronized void closeSock() {
+                  if (sock != null) {
+                      try { sock.close(); } catch (IOException ignored) { }
+                  }
+                  sock = null;
+                  out = null;
+              }
+
+              void reportState() {
+                  boolean connected;
+                  synchronized (this) {
+                      connected = sock != null;
+                  }
+                  js("_state", connected ? "connected" : "disconnected", connected ? peerName : "");
+              }
+
+              // ===== واجهة الصفحة =====
+              @JavascriptInterface
+              public void ready() {
+                  startServer();
+                  reportState();
+              }
+
+              @JavascriptInterface
+              public void listDevices() {
+                  if (adapter == null) {
+                      toast("هذا الجهاز لا يدعم البلوثوث");
+                      return;
+                  }
+                  if (!hasPerm()) {
+                      act.runOnUiThread(() -> {
+                          if (act instanceof MainActivity) ((MainActivity) act).requestNeededPermissions();
+                      });
+                      toast("اسمح للبرنامج باستخدام البلوثوث ثم أعد المحاولة");
+                      return;
+                  }
+                  try {
+                      if (!adapter.isEnabled()) {
+                          act.runOnUiThread(() -> {
+                              try {
+                                  act.startActivityForResult(new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), REQ_ENABLE);
+                              } catch (Exception e) {
+                                  toast("شغّل البلوثوث من إعدادات الجوال");
+                              }
+                          });
+                          return;
+                      }
+                      JSONArray arr = new JSONArray();
+                      Set<BluetoothDevice> bonded = adapter.getBondedDevices();
+                      if (bonded != null) {
+                          for (BluetoothDevice d : bonded) {
+                              JSONObject o = new JSONObject();
+                              o.put("name", d.getName() == null ? "" : d.getName());
+                              o.put("address", d.getAddress());
+                              arr.put(o);
+                          }
+                      }
+                      startServer();
+                      js("_devices", arr.toString());
+                  } catch (Exception e) {
+                      toast("تعذّر قراءة الأجهزة المقترنة");
+                  }
+              }
+
+              @JavascriptInterface
+              public void connect(final String address) {
+                  if (adapter == null || !hasPerm()) return;
+                  Thread t = new Thread(() -> {
+                      try {
+                          if (adapter.isDiscovering()) adapter.cancelDiscovery();
+                          BluetoothDevice dev = adapter.getRemoteDevice(address);
+                          BluetoothSocket s = dev.createRfcommSocketToServiceRecord(SERVICE_UUID);
+                          s.connect();
+                          synchronized (BtBridge.this) {
+                              if (sock != null) {
+                                  try { sock.close(); } catch (IOException ignored) { }
+                                  sock = null;
+                              }
+                          }
+                          onConnected(s);
+                      } catch (Exception e) {
+                          js("_state", "failed", "");
+                      }
+                  }, "bt-connect");
+                  t.setDaemon(true);
+                  t.start();
+              }
+
+              @JavascriptInterface
+              public void send(String text) {
+                  OutputStream o;
+                  synchronized (this) {
+                      o = out;
+                  }
+                  if (o == null) return;
+                  try {
+                      synchronized (o) {
+                          o.write((text.replace("\n", " ") + "\n").getBytes(StandardCharsets.UTF_8));
+                          o.flush();
+                      }
+                  } catch (IOException e) {
+                      closeSock();
+                      js("_state", "disconnected", "");
+                      startServer();
+                  }
+              }
+
+              @JavascriptInterface
+              public void disconnect() {
+                  closeSock();
+                  js("_state", "disconnected", "");
+              }
+
+              @JavascriptInterface
+              public void openSettings() {
+                  act.runOnUiThread(() -> {
+                      try {
+                          act.startActivity(new Intent(Settings.ACTION_BLUETOOTH_SETTINGS));
+                      } catch (Exception ignored) {
+                      }
+                  });
+              }
+
+              @JavascriptInterface
+              public void share(final String text) {
+                  act.runOnUiThread(() -> {
+                      Intent i = new Intent(Intent.ACTION_SEND);
+                      i.setType("text/plain");
+                      i.putExtra(Intent.EXTRA_TEXT, text);
+                      act.startActivity(Intent.createChooser(i, "مشاركة"));
+                  });
+              }
+
+              @JavascriptInterface
+              public void notify(String title, String body) {
+                  if (Build.VERSION.SDK_INT >= 33
+                          && act.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                      return;
+                  }
+                  NotificationManager nm = (NotificationManager) act.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+                  Intent open = new Intent(act, MainActivity.class);
+                  open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                  PendingIntent pi = PendingIntent.getActivity(act, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  Notification.Builder b = Build.VERSION.SDK_INT >= 26
+                          ? new Notification.Builder(act, CHANNEL)
+                          : new Notification.Builder(act);
+                  b.setSmallIcon(android.R.drawable.ic_dialog_info)
+                          .setContentTitle(title)
+                          .setContentText(body)
+                          .setStyle(new Notification.BigTextStyle().bigText(body))
+                          .setAutoCancel(true)
+                          .setContentIntent(pi);
+                  nm.notify(notifId++, b.build());
+              }
+
+              void shutdown() {
+                  alive = false;
+                  try { act.unregisterReceiver(stateReceiver); } catch (Exception ignored) { }
+                  closeServer();
+                  closeSock();
+              }
+          }
+          EOF_FILE
+          echo "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" | base64 -d > android/app/release.p12
+          cp index.html manifest.json icon-192.png icon-512.png android/app/src/main/assets/
+          cp icon-192.png android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+
+      - name: Build signed APK
+        run: |
+          cd android
+          gradle --no-daemon assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk ../todo-share.apk
+
+      - name: Publish download
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk
+          name: "تطبيق المهام المشتركة (APK)"
+          body: "آخر نسخة من تطبيق أندرويد — بناء رقم ${{ github.run_number }}. رابط التحميل المباشر: https://github.com/MUSBAHSAAD/todo-share/releases/download/apk/todo-share.apk"
+          files: todo-share.apk
+          make_latest: true
