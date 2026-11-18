@@ -235,7 +235,10 @@ function detectChanges(){
   if(prev&&firstSync){
     for(const id in cur){
       const L=cur[id],P=prev[id];
-      if(!P){if(L.fromId!==S.id&&!L.archived)notify('📥 قائمة جديدة من '+(L.from||''),L.title+' — '+stats(L).n+' صنف');continue;}
+      if(!P){
+        if(L.archived){if(L.archived.byId!==S.id)notify('📦 '+(L.archived.by||'الطرف الآخر')+' أكمل الشراء',L.title+' — المجموع '+money(stats(L).total));}
+        else if(L.fromId!==S.id)notify('📥 قائمة جديدة من '+(L.from||''),L.title+' — '+stats(L).n+' صنف');
+        continue;}
       const pi={};itemsOf(P).forEach(x=>pi[x.k]=x);
       itemsOf(L).forEach(x=>{
         const o=pi[x.k];
@@ -342,38 +345,53 @@ function saveTitle(lid){
 }
 async function delList(id){
   const L=getL(id);if(!L)return;
-  if(!confirm('حذف القائمة «'+L.title+'» نهائياً؟ ستُحذف عند الطرفين، ومن الأرشيف أيضاً.'))return;
+  if(!confirm('حذف القائمة «'+L.title+'» نهائياً؟ ستُحذف عند الطرفين.'+(L.archived?'':' (النسخ المحفوظة في الأرشيف تبقى)')))return;
   try{await api('DELETE','/lists/'+id);delete R.lists[id];save();UI.open=null;render();toast('🗑 تم الحذف');}
   catch(e){toast('⚠️ تعذّر الحذف — تحقق من الإنترنت');}
 }
 
 /* ===== الصنف: شراء / سعر / تعديل / حذف ===== */
+const isSender=L=>L.fromId===S.id;   // المُرسِل يكتب القائمة ويعدّلها، والطرف الآخر يشتري
 function openItem(lid,k){
   const L=getL(lid);if(!L||L.archived)return;
   const it=L.items&&L.items[k];if(!it)return;
   const done=!!it.d;
+  if(isSender(L)){
+    $('sheetBody').innerHTML='<h3>✏️ تعديل صنف</h3>'+
+      (done?'<div class="status">✓ اشتراه '+esc(it.by||'')+' بـ '+money(it.p)+' — '+fmtD(it.d)+'</div>':'<div class="hint">الشراء يتم من الطرف الآخر.</div>')+
+      '<label>الصنف</label><input id="iName" maxlength="120" value="'+esc(it.t)+'">'+
+      '<button class="btn" onclick="saveItem(\''+lid+'\',\''+k+'\',\'rename\')">💾 حفظ الاسم</button>'+
+      '<button class="btn danger" onclick="delItem(\''+lid+'\',\''+k+'\')">🗑 حذف الصنف</button>'+
+      '<button class="btn ghost" onclick="closeM(\'mSheet\')">إغلاق</button>';
+    openM('mSheet');
+    const ni=$('iName');ni.addEventListener('keydown',e=>{if(e.key==='Enter')saveItem(lid,k,'rename');});
+    return;
+  }
   $('sheetBody').innerHTML='<h3>'+(done?'✓ تم شراؤه':'🛒 شراء صنف')+'</h3>'+
-    (done?'<div class="hint">اشتراه '+esc(it.by||'')+' — '+fmtD(it.d)+'</div>':'')+
-    '<label>الصنف</label><input id="iName" maxlength="120" value="'+esc(it.t)+'">'+
+    '<div class="title" style="margin:6px 0">'+esc(it.t)+'</div>'+
+    (done?'<div class="hint">اشتريته — '+fmtD(it.d)+'</div>':'')+
     '<label>الثمن ('+CUR+')</label><input id="iPrice" class="big" inputmode="decimal" placeholder="0" value="'+(it.p?esc(it.p):'')+'">'+
     '<div class="hint">اترك الثمن فارغاً إن لم تعرفه، ويمكن تعديله لاحقاً.</div>'+
-    (done?'<button class="btn" onclick="saveItem(\''+lid+'\',\''+k+'\',\'save\')">💾 حفظ التعديل</button>'+
+    (done?'<button class="btn" onclick="saveItem(\''+lid+'\',\''+k+'\',\'save\')">💾 حفظ الثمن</button>'+
           '<button class="btn ghost" onclick="saveItem(\''+lid+'\',\''+k+'\',\'undo\')">↩️ إلغاء الشراء</button>'
-         :'<button class="btn wa" onclick="saveItem(\''+lid+'\',\''+k+'\',\'buy\')">✓ تم الشراء</button>'+
-          '<button class="btn ghost" onclick="saveItem(\''+lid+'\',\''+k+'\',\'save\')">💾 حفظ الاسم فقط</button>')+
-    '<button class="btn danger" onclick="delItem(\''+lid+'\',\''+k+'\')">🗑 حذف الصنف</button>';
+         :'<button class="btn wa" onclick="saveItem(\''+lid+'\',\''+k+'\',\'buy\')">✓ تم الشراء</button>')+
+    '<button class="btn ghost" onclick="closeM(\'mSheet\')">إغلاق</button>';
   openM('mSheet');
   const pi=$('iPrice');pi.addEventListener('keydown',e=>{if(e.key==='Enter')saveItem(lid,k,done?'save':'buy');});
   setTimeout(()=>pi.focus(),250);
 }
 function saveItem(lid,k,mode){
   const L=getL(lid);if(!L)return;const it=L.items&&L.items[k];if(!it)return;
-  const t=$('iName').value.trim();if(!t){toast('اكتب اسم الصنف');return;}
-  const p=parseNum($('iPrice').value);if(isNaN(p)){toast('الثمن غير صحيح');return;}
   let patch;
-  if(mode==='buy')patch={t,p,d:Date.now(),by:S.me,byId:S.id};
-  else if(mode==='undo')patch={t,p:0,d:0};
-  else patch=it.d?{t,p}:{t};
+  if(mode==='rename'){
+    const t=$('iName').value.trim();if(!t){toast('اكتب اسم الصنف');return;}
+    patch={t};
+  }else{
+    const p=parseNum($('iPrice').value);if(isNaN(p)){toast('الثمن غير صحيح');return;}
+    if(mode==='buy')patch={p,d:Date.now(),by:S.me,byId:S.id};
+    else if(mode==='undo')patch={p:0,d:0};
+    else patch={p};
+  }
   closeM('mSheet');
   if(navigator.vibrate)navigator.vibrate(mode==='buy'?35:15);
   write('PATCH','/lists/'+lid+'/items/'+k,patch,()=>Object.assign(it,patch));
@@ -391,21 +409,24 @@ function askArchive(lid){
   $('sheetBody').innerHTML='<h3>📦 إكمال الشراء</h3>'+
     '<div class="totbox"><span>المجموع</span><b>'+money(s.total)+'</b></div>'+
     '<div class="status">تم شراء <b>'+s.d+'</b> من <b>'+s.n+'</b> صنف.'+(s.d<s.n?' الأصناف غير المشتراة تُحفظ في الأرشيف على أنها «لم تُشترَ».':'')+
-    '<br>ستنتقل القائمة إلى الأرشيف عند الطرفين.</div>'+
+    '<br>تُحفظ نسخة في الأرشيف عند الطرفين، ثم <b>تُصفَّر القائمة</b>: تبقى الأصناف نفسها وتُلغى المشتريات والأسعار لتُستعمل من جديد.</div>'+
     '<button class="btn gold" onclick="doArchive(\''+lid+'\')">✅ تم — نقل إلى الأرشيف</button>'+
     '<button class="btn ghost" onclick="closeM(\'mSheet\')">رجوع</button>';
   openM('mSheet');
 }
 async function doArchive(lid){
   const L=getL(lid);if(!L)return;const s=stats(L);
-  const a={at:Date.now(),by:S.me,byId:S.id,total:s.total,bought:s.d,count:s.n};
+  const now=Date.now(),a={at:now,by:S.me,byId:S.id,total:s.total,bought:s.d,count:s.n};
+  const aid=lid+'_a'+now.toString(36);
+  const copy=JSON.parse(JSON.stringify(L));copy.archived=a;copy.srcId=lid;delete copy.lastArch;
   closeM('mSheet');
-  if(await write('PATCH','/lists/'+lid,{archived:a},()=>{L.archived=a;})){UI.tab='arch';UI.open=lid;render();toast('📦 حُفظت في الأرشيف — المجموع '+money(s.total));}
-}
-function unarchive(lid){
-  const L=getL(lid);if(!L)return;
-  if(!confirm('إعادة القائمة إلى القوائم النشطة؟'))return;
-  write('PATCH','/lists/'+lid,{archived:null},()=>{delete L.archived;}).then(ok=>{if(ok){UI.tab='lists';render();}});
+  // 1) نسخة في الأرشيف
+  if(!await write('PUT','/lists/'+aid,copy,()=>{R.lists[aid]=copy;}))return;
+  // 2) تصفير القائمة النشطة: نفس الأصناف بدون شراء ولا أسعار
+  const reset={lastArch:now};
+  itemsOf(L).forEach(x=>{reset['items/'+x.k+'/d']=0;reset['items/'+x.k+'/p']=0;});
+  await write('PATCH','/lists/'+lid,reset,()=>{L.lastArch=now;itemsOf(L).forEach(x=>{const it=L.items[x.k];it.d=0;it.p=0;});});
+  render();toast('📦 حُفظت في الأرشيف — المجموع '+money(s.total)+' — وصُفّرت القائمة');
 }
 
 /* ===== فلتر الأرشيف ===== */
@@ -438,7 +459,7 @@ function listCards(arr,arch){
   return arr.map(L=>{const isNew=!arch&&L.fromId!==S.id&&!S.seen[L.id];const s=stats(L);
     return '<div class="card click'+(isNew?' new':'')+'" onclick="openList(\''+L.id+'\')"><div class="row between"><span class="title">'+esc(L.title)+(isNew?'<span class="tag">جديد</span>':'')+'</span>'+
       (arch?'<span class="money">'+money(s.total)+'</span>':fracTag(L))+'</div>'+
-      '<div class="meta">'+(arch?'📦 '+fmtDay(L.archived.at)+' · '+esc(L.archived.by||'')+' · '+s.d+' من '+s.n+' صنف':'من: '+esc(L.from)+(L.to?' ← '+esc(L.to):'')+' · '+fmtD(L.created)+(s.total?' · <span class="money">'+money(s.total)+'</span>':''))+'</div>'+
+      '<div class="meta">'+(arch?'📦 '+fmtDay(L.archived.at)+' · '+esc(L.archived.by||'')+' · '+s.d+' من '+s.n+' صنف':(isSender(L)?'📤 أرسلتها'+(L.to?' إلى '+esc(L.to):''):'🛒 للشراء — من '+esc(L.from))+' · '+fmtD(L.created)+(s.total?' · <span class="money">'+money(s.total)+'</span>':''))+'</div>'+
       (arch?'':progress(L))+'</div>';}).join('');
 }
 function pairScreen(){
@@ -472,22 +493,24 @@ function render(){
   if(UI.open){
     const L=getL(UI.open);
     if(!L){UI.open=null;return render();}
-    const Lx=Object.assign({},L,{id:UI.open}),s=stats(Lx),arch=!!L.archived,items=itemsOf(Lx);
+    const Lx=Object.assign({},L,{id:UI.open}),s=stats(Lx),arch=!!L.archived,items=itemsOf(Lx),snd=isSender(L);
+    const role=arch?'':snd?'<div class="status">📤 أنت مُرسِل هذه القائمة: تضيف الأصناف وتعدّلها، و'+esc(L.to||'الطرف الآخر')+' يشتريها. ترى كل شراء وثمنه فوراً.</div>'
+                         :'<div class="status">🛒 أنت المشتري: اضغط على الصنف عند شرائه واكتب ثمنه، ثم «تم» عند انتهاء التسوق.</div>';
     let h='<button class="back" onclick="go(\''+(arch?'arch':'lists')+'\')">→ رجوع</button>'+
       '<div class="card"><div class="row between"><span class="title" style="font-size:18px">'+esc(L.title)+'</span>'+
-      (arch?'':'<button class="ibtn" title="تعديل" onclick="editTitle(\''+Lx.id+'\')">✏️</button>')+'</div>'+
-      '<div class="meta">من: '+esc(L.from)+(L.to?' ← '+esc(L.to):'')+' · '+fmtD(L.created)+'</div>'+
-      (arch?'<div class="status">📦 أُكملت في '+fmtD(L.archived.at)+' بواسطة '+esc(L.archived.by||'')+' — تم شراء '+s.d+' من '+s.n+'</div>':
-        progress(Lx)+'<div class="hint" style="margin-top:8px">اضغط على الصنف عند شرائه واكتب ثمنه. كل تعديل يظهر فوراً عند الطرفين.</div>')+
+      (!arch&&snd?'<button class="ibtn" title="تعديل" onclick="editTitle(\''+Lx.id+'\')">✏️</button>':'')+'</div>'+
+      '<div class="meta">من: '+esc(L.from)+(L.to?' ← '+esc(L.to):'')+' · '+fmtD(L.created)+(L.lastArch&&!arch?' · آخر أرشفة '+fmtD(L.lastArch):'')+'</div>'+
+      (arch?'<div class="status">📦 أُكملت في '+fmtD(L.archived.at)+' بواسطة '+esc(L.archived.by||'')+' — تم شراء '+s.d+' من '+s.n+'</div>':progress(Lx)+role)+
       '<div class="totbox"><span>المجموع'+(arch?'':' حتى الآن')+'</span><b>'+money(s.total)+'</b></div>'+
       '</div>';
     h+=items.map((x,i)=>itemHTML(Lx,x,i,arch)).join('')||'<div class="empty" style="padding:20px">لا توجد أصناف</div>';
-    if(!arch){
+    if(!arch&&snd){
       h+='<div class="addrow"><input id="addIn" maxlength="120" placeholder="إضافة صنف جديد…" onkeydown="if(event.key===\'Enter\')addItem(\''+Lx.id+'\')"><button class="btn" onclick="addItem(\''+Lx.id+'\')">➕</button></div>'+
-         '<button class="btn gold" onclick="askArchive(\''+Lx.id+'\')">✅ تم — إكمال الشراء ونقلها للأرشيف</button>';
+         '<button class="btn danger" onclick="delList(\''+Lx.id+'\')">🗑 حذف القائمة</button>';
+    }else if(!arch){
+      h+='<button class="btn gold" onclick="askArchive(\''+Lx.id+'\')">✅ تم — إكمال الشراء وأرشفتها</button>';
     }else{
-      h+='<button class="btn ghost" onclick="unarchive(\''+Lx.id+'\')">↩️ إعادة إلى القوائم النشطة</button>'+
-         '<button class="btn danger" onclick="delList(\''+Lx.id+'\')">🗑 حذف من الأرشيف</button>';
+      h+='<button class="btn danger" onclick="delList(\''+Lx.id+'\')">🗑 حذف من الأرشيف</button>';
     }
     paint(h);return;
   }
